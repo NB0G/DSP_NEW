@@ -1,33 +1,40 @@
-from scipy.fft import fftshift, irfft, rfftfreq
+import numpy as np
+from scipy.signal import cheby2, sosfilt
 
-from filters.chebyshev.chebyshev_bandpass_filter import chebyshev_band_pass_gain
-from filters.chebyshev.chebyshev_highpass_filter import chebyshev_high_pass_gain
-from filters.chebyshev.chebyshev_lowpass_filter import (
-    DEFAULT_ORDER,
-    DEFAULT_RIPPLE_DB,
-    chebyshev_low_pass_gain,
-)
-from util import (
-    StreamingFirFilter,
-    build_hamming_window,
-    db_to_gain,
-    make_odd,
-    ripple_db_to_epsilon,
-)
+from util import db_to_gain
 
 
 CHEBYSHEV_BANDS = [
     ("low_pass", 0, 100),
     ("band_pass", 100, 300),
-    ("band_pass", 300, 700),
-    ("band_pass", 700, 1500),
-    ("band_pass", 1500, 3100),
-    ("band_pass", 3100, 6300),
-    ("band_pass", 6300, 12700),
-    ("high_pass", 12700, 22050),
+    ("band_pass", 300, 1000),
+    ("band_pass", 1000, 3000),
+    ("band_pass", 3000, 8000),
+    ("high_pass", 8000, 22050),
 ]
-DEFAULT_TAP_COUNT = 2049
-DEFAULT_FFT_SIZE = 8192
+DEFAULT_ORDER = 4
+DEFAULT_STOPBAND_ATTENUATION_DB = 40
+NYQUIST_MARGIN = 0.99
+
+
+class StreamingSosFilter:
+    def __init__(self, sos, gain_db=0):
+        self.sos = sos
+        self.zi = np.zeros((len(sos), 2))
+        self.set_gain_db(gain_db)
+
+    def set_gain_db(self, gain_db):
+        self.gain_db = gain_db
+        self.gain = db_to_gain(gain_db)
+
+    def process_samples(self, samples):
+        samples = list(samples)
+        if not samples:
+            return []
+
+        filtered_samples, self.zi = sosfilt(self.sos, samples, zi=self.zi)
+
+        return (filtered_samples * self.gain).tolist()
 
 
 class ChebyshevFilterBank:
@@ -36,95 +43,104 @@ class ChebyshevFilterBank:
         sample_rate,
         band_gains_db,
         order=DEFAULT_ORDER,
-        ripple_db=DEFAULT_RIPPLE_DB,
-        tap_count=DEFAULT_TAP_COUNT,
-        fft_size=DEFAULT_FFT_SIZE,
+        stopband_attenuation_db=DEFAULT_STOPBAND_ATTENUATION_DB,
     ):
         self.sample_rate = sample_rate
         self.order = order
-        self.epsilon = ripple_db_to_epsilon(ripple_db)
-        self.tap_count = make_odd(tap_count)
-        self.fft_size = max(fft_size, self.tap_count * 4)
+        self.stopband_attenuation_db = stopband_attenuation_db
         self.band_gains_db = band_gains_db.copy()
-        self.band_gains = {}
+        self.filters_by_band = {}
 
-        for band_number, gain_db in self.band_gains_db.items():
-            self.band_gains[band_number] = db_to_gain(gain_db)
+        self.build_filters()
 
-        self.filter = StreamingFirFilter([0] * self.tap_count)
-        self.rebuild_kernel()
+    def build_filters(self):
+        nyquist_hz = self.sample_rate / 2
+
+        for band_number, (filter_type, low_cutoff_hz, high_cutoff_hz) in enumerate(
+            CHEBYSHEV_BANDS,
+            start=1,
+        ):
+            sos = self.build_band_sos(
+                filter_type,
+                low_cutoff_hz,
+                high_cutoff_hz,
+                nyquist_hz,
+            )
+
+            if sos is None:
+                continue
+
+            gain_db = self.band_gains_db.get(band_number, 0)
+            self.filters_by_band[band_number] = StreamingSosFilter(sos, gain_db)
+
+    def build_band_sos(
+        self,
+        filter_type,
+        low_cutoff_hz,
+        high_cutoff_hz,
+        nyquist_hz,
+    ):
+        max_cutoff_hz = nyquist_hz * NYQUIST_MARGIN
+
+        if filter_type == "low_pass":
+            cutoff_hz = min(high_cutoff_hz, max_cutoff_hz)
+            if cutoff_hz <= 0:
+                return None
+
+            return cheby2(
+                self.order,
+                self.stopband_attenuation_db,
+                cutoff_hz,
+                btype="lowpass",
+                fs=self.sample_rate,
+                output="sos",
+            )
+
+        if filter_type == "high_pass":
+            cutoff_hz = min(low_cutoff_hz, max_cutoff_hz)
+            if cutoff_hz <= 0 or cutoff_hz >= max_cutoff_hz:
+                return None
+
+            return cheby2(
+                self.order,
+                self.stopband_attenuation_db,
+                cutoff_hz,
+                btype="highpass",
+                fs=self.sample_rate,
+                output="sos",
+            )
+
+        high_cutoff_hz = min(high_cutoff_hz, max_cutoff_hz)
+        if low_cutoff_hz <= 0 or low_cutoff_hz >= high_cutoff_hz:
+            return None
+
+        return cheby2(
+            self.order,
+            self.stopband_attenuation_db,
+            [low_cutoff_hz, high_cutoff_hz],
+            btype="bandpass",
+            fs=self.sample_rate,
+            output="sos",
+        )
 
     def set_band_gain(self, band_number, gain_db):
         self.band_gains_db[band_number] = gain_db
-        self.band_gains[band_number] = db_to_gain(gain_db)
-        self.rebuild_kernel()
 
-    def rebuild_kernel(self):
-        frequencies = rfftfreq(self.fft_size, 1 / self.sample_rate)
-        frequency_response = []
-
-        for frequency_hz in frequencies:
-            frequency_response.append(self.combined_gain(frequency_hz))
-
-        impulse_response = fftshift(irfft(frequency_response, self.fft_size)).tolist()
-        center = len(impulse_response) // 2
-        half_taps = self.tap_count // 2
-        kernel = impulse_response[center - half_taps:center + half_taps + 1]
-        window = build_hamming_window(len(kernel))
-
-        self.filter.kernel = [
-            kernel_value * window_value
-            for kernel_value, window_value in zip(kernel, window)
-        ]
-        self.filter.kernel_fft_by_size = {}
-
-    def combined_gain(self, frequency_hz):
-        band_index, band = self.band_for_frequency(frequency_hz)
-        if band is None:
-            return 0
-
-        filter_type, low_cutoff_hz, high_cutoff_hz = band
-        band_gain = self.band_gains[band_index]
-
-        if filter_type == "low_pass":
-            filter_gain = chebyshev_low_pass_gain(
-                frequency_hz,
-                high_cutoff_hz,
-                self.order,
-                self.epsilon,
-            )
-        elif filter_type == "high_pass":
-            filter_gain = chebyshev_high_pass_gain(
-                frequency_hz,
-                low_cutoff_hz,
-                self.order,
-                self.epsilon,
-            )
-        else:
-            filter_gain = chebyshev_band_pass_gain(
-                frequency_hz,
-                low_cutoff_hz,
-                high_cutoff_hz,
-                self.order,
-                self.epsilon,
-            )
-
-        return filter_gain * band_gain
-
-    def band_for_frequency(self, frequency_hz):
-        nyquist_hz = self.sample_rate / 2
-
-        for band_index, band in enumerate(CHEBYSHEV_BANDS, start=1):
-            filter_type, low_cutoff_hz, high_cutoff_hz = band
-            high_cutoff_hz = min(high_cutoff_hz, nyquist_hz)
-
-            if filter_type == "high_pass":
-                if low_cutoff_hz <= frequency_hz <= nyquist_hz:
-                    return band_index, band
-            elif low_cutoff_hz <= frequency_hz < high_cutoff_hz:
-                return band_index, band
-
-        return None, None
+        audio_filter = self.filters_by_band.get(band_number)
+        if audio_filter is not None:
+            audio_filter.set_gain_db(gain_db)
 
     def process_samples(self, samples):
-        return self.filter.process_samples(samples)
+        samples = list(samples)
+        if not samples:
+            return []
+
+        mixed_samples = [0.0] * len(samples)
+
+        for audio_filter in self.filters_by_band.values():
+            filtered_samples = audio_filter.process_samples(samples)
+
+            for index, sample in enumerate(filtered_samples):
+                mixed_samples[index] += sample
+
+        return mixed_samples

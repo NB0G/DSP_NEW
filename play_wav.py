@@ -3,15 +3,13 @@ import wave
 from array import array
 from threading import Thread
 
-import pyaudio
-
 from buffers.dual_thread_ring_buffer import RingBufferDualThread
 from buffers.shifting_buffer import ShiftingBuffer
 from buffers.single_thread_ring_buffer import SingleThreadRingBuffer
 from filters.chebyshev.chebyshev_filter_bank import ChebyshevFilterBank
-from filters.sinc.sinc_filter_bank import (
+from filters.chebyshev_window.chebyshev_window_filter_bank import (
+    ChebyshevWindowFirFilterBank,
     DEFAULT_TAP_COUNT,
-    HammingSincFilterBank,
 )
 
 
@@ -19,17 +17,18 @@ DEFAULT_BLOCK_SIZE = 64
 DEFAULT_RING_BUFFER_SIZE_BYTES = 32
 DUAL_THREAD_INPUT_FRAMES_PER_CYCLE = 2
 SINGLE_THREAD_INPUT_FRAMES_PER_CYCLE = 8
-RING_BUFFER_OUTPUT_FRAMES_PER_CYCLE = 1
+RING_BUFFER_OUTPUT_FRAMES_PER_CYCLE = 8
 SAMPLE_READ_TIMEOUT_SECONDS = 0.01
-DEFAULT_REVERB_DELAY_MS = 120
-DEFAULT_REVERB_DECAY = 0.35
-DEFAULT_REVERB_WET = 0.35
-DEFAULT_CLIPPING_THRESHOLD = 12000
+DEFAULT_ECHO_DELAY_MS = 220
+DEFAULT_ECHO_FEEDBACK = 0.35
+DEFAULT_ECHO_WET = 0.4
+DEFAULT_CLIPPING_THRESHOLD = 1200
 BUFFER_MODE_DUAL_THREAD = "dual_thread"
 BUFFER_MODE_SINGLE_THREAD = "single_thread"
 BUFFER_MODE_SHIFTING = "shifting"
-FILTER_TYPE_SINC = "sinc"
-FILTER_TYPE_CHEBYSHEV = "chebyshev"
+FILTER_TYPE_CHEBYSHEV = "chebyshev_iir"
+FILTER_TYPE_CHEBYSHEV_WINDOW_FIR = "chebyshev_window_fir"
+FILTER_TYPE_SINC = FILTER_TYPE_CHEBYSHEV_WINDOW_FIR
 OUTPUT_CHANNELS = 1
 BYTES_PER_SAMPLE = 2
 DEFAULT_BAND_GAINS_DB = {
@@ -39,9 +38,18 @@ DEFAULT_BAND_GAINS_DB = {
     4: 0,
     5: 0,
     6: 0,
-    7: 0,
-    8: 0,
 }
+
+
+def require_pyaudio():
+    try:
+        import pyaudio
+    except ImportError as error:
+        raise RuntimeError(
+            "PyAudio не установлен. Установите PortAudio и PyAudio для воспроизведения."
+        ) from error
+
+    return pyaudio
 
 
 def clamp_int16(value):
@@ -83,12 +91,12 @@ def sample_to_bytes(sample):
     return pcm.tobytes()
 
 
-def build_sinc_filter_bank(sample_rate, taps, band_gains_db=None):
+def build_chebyshev_window_fir_filter_bank(sample_rate, taps, band_gains_db=None):
     gains = DEFAULT_BAND_GAINS_DB.copy()
     if band_gains_db is not None:
         gains.update(band_gains_db)
 
-    return HammingSincFilterBank(sample_rate, gains, taps)
+    return ChebyshevWindowFirFilterBank(sample_rate, gains, taps)
 
 
 def build_chebyshev_filter_bank(sample_rate, band_gains_db=None):
@@ -99,11 +107,16 @@ def build_chebyshev_filter_bank(sample_rate, band_gains_db=None):
     return ChebyshevFilterBank(sample_rate, gains)
 
 
-def build_filter_bank(sample_rate, taps, band_gains_db=None, filter_type=FILTER_TYPE_SINC):
+def build_filter_bank(
+    sample_rate,
+    taps,
+    band_gains_db=None,
+    filter_type=FILTER_TYPE_CHEBYSHEV,
+):
     if filter_type == FILTER_TYPE_CHEBYSHEV:
         return build_chebyshev_filter_bank(sample_rate, band_gains_db)
 
-    return build_sinc_filter_bank(sample_rate, taps, band_gains_db)
+    return build_chebyshev_window_fir_filter_bank(sample_rate, taps, band_gains_db)
 
 
 def mix_filter_outputs(filter_outputs):
@@ -131,32 +144,34 @@ def clip_samples(samples, threshold=DEFAULT_CLIPPING_THRESHOLD):
     return [max(-threshold, min(threshold, sample)) for sample in samples]
 
 
-class ReverbEffect:
+class EchoEffect:
     def __init__(
         self,
         sample_rate,
-        delay_ms=DEFAULT_REVERB_DELAY_MS,
-        decay=DEFAULT_REVERB_DECAY,
-        wet=DEFAULT_REVERB_WET,
+        delay_ms=DEFAULT_ECHO_DELAY_MS,
+        feedback=DEFAULT_ECHO_FEEDBACK,
+        wet=DEFAULT_ECHO_WET,
     ):
         delay_samples = max(1, int(sample_rate * delay_ms / 1000))
         self.buffer = [0.0] * delay_samples
         self.index = 0
-        self.decay = decay
+        self.feedback = feedback
         self.wet = wet
-        self.dry = 1 - wet
 
     def process_samples(self, samples):
         processed_samples = []
 
         for sample in samples:
             delayed_sample = self.buffer[self.index]
-            output_sample = sample * self.dry + delayed_sample * self.wet
-            self.buffer[self.index] = sample + delayed_sample * self.decay
+            output_sample = sample + delayed_sample * self.wet
+            self.buffer[self.index] = sample + delayed_sample * self.feedback
             self.index = (self.index + 1) % len(self.buffer)
             processed_samples.append(output_sample)
 
         return processed_samples
+
+
+ReverbEffect = EchoEffect
 
 
 class EqualizerPlayer:
@@ -164,12 +179,13 @@ class EqualizerPlayer:
         self,
         file_path,
         buffer_mode=BUFFER_MODE_DUAL_THREAD,
-        filter_type=FILTER_TYPE_SINC,
+        filter_type=FILTER_TYPE_CHEBYSHEV,
         taps=DEFAULT_TAP_COUNT,
         ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
         band_gains_db=None,
-        reverb_enabled=False,
+        echo_enabled=False,
         clipping_enabled=False,
+        reverb_enabled=None,
     ):
         self.file_path = file_path
         self.buffer_mode = buffer_mode
@@ -179,10 +195,10 @@ class EqualizerPlayer:
         self.ring_buffer_size_bytes = ring_buffer_size_bytes
         self.band_gains_db = DEFAULT_BAND_GAINS_DB.copy()
         self.filters = []
-        self.reverb = None
+        self.echo = None
         self.ring_buffer = None
         self.stopped = False
-        self.reverb_enabled = reverb_enabled
+        self.echo_enabled = echo_enabled if reverb_enabled is None else reverb_enabled
         self.clipping_enabled = clipping_enabled
 
         if band_gains_db is not None:
@@ -197,8 +213,11 @@ class EqualizerPlayer:
             else:
                 self.filters[band_number - 1].set_gain_db(gain_db)
 
+    def set_echo_enabled(self, enabled):
+        self.echo_enabled = enabled
+
     def set_reverb_enabled(self, enabled):
-        self.reverb_enabled = enabled
+        self.set_echo_enabled(enabled)
 
     def set_clipping_enabled(self, enabled):
         self.clipping_enabled = enabled
@@ -224,13 +243,13 @@ class EqualizerPlayer:
             self.band_gains_db,
             self.filter_type,
         )
-        self.reverb = ReverbEffect(sample_rate)
+        self.echo = EchoEffect(sample_rate)
 
     def process_audio_samples(self, samples):
         processed_samples = process_samples_with_filter_bank(samples, self.filters)
 
-        if self.reverb_enabled:
-            processed_samples = self.reverb.process_samples(processed_samples)
+        if self.echo_enabled:
+            processed_samples = self.echo.process_samples(processed_samples)
 
         if self.clipping_enabled:
             processed_samples = clip_samples(processed_samples)
@@ -290,6 +309,7 @@ class EqualizerPlayer:
         wav_file = wave.open(self.file_path, "rb")
         sample_rate = wav_file.getframerate()
         self.build_filters(sample_rate)
+        pyaudio = require_pyaudio()
 
         self.ring_buffer = RingBufferDualThread(self.ring_buffer_size_bytes)
 
@@ -349,6 +369,7 @@ class EqualizerPlayer:
         channels = wav_file.getnchannels()
         sample_rate = wav_file.getframerate()
         self.build_filters(sample_rate)
+        pyaudio = require_pyaudio()
 
         self.ring_buffer = SingleThreadRingBuffer(self.ring_buffer_size_bytes)
 
@@ -420,6 +441,7 @@ class EqualizerPlayer:
         input_bytes_per_frame = channels * wav_file.getsampwidth()
         sample_rate = wav_file.getframerate()
         self.build_filters(sample_rate)
+        pyaudio = require_pyaudio()
 
         self.ring_buffer = ShiftingBuffer(self.ring_buffer_size_bytes)
         input_frames_per_chunk = max(
@@ -482,9 +504,10 @@ def play_wav_with_filter_dual_thread(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_SINC,
-    reverb_enabled=False,
+    filter_type=FILTER_TYPE_CHEBYSHEV,
+    echo_enabled=False,
     clipping_enabled=False,
+    reverb_enabled=None,
 ):
     player = EqualizerPlayer(
         file_path,
@@ -493,8 +516,9 @@ def play_wav_with_filter_dual_thread(
         taps,
         ring_buffer_size_bytes,
         band_gains_db,
-        reverb_enabled,
+        echo_enabled,
         clipping_enabled,
+        reverb_enabled,
     )
     player.play()
 
@@ -504,9 +528,10 @@ def play_wav_with_filter_single_thread(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_SINC,
-    reverb_enabled=False,
+    filter_type=FILTER_TYPE_CHEBYSHEV,
+    echo_enabled=False,
     clipping_enabled=False,
+    reverb_enabled=None,
 ):
     player = EqualizerPlayer(
         file_path,
@@ -515,8 +540,9 @@ def play_wav_with_filter_single_thread(
         taps,
         ring_buffer_size_bytes,
         band_gains_db,
-        reverb_enabled,
+        echo_enabled,
         clipping_enabled,
+        reverb_enabled,
     )
     player.play()
 
@@ -526,9 +552,10 @@ def play_wav_with_filter_shifting_buffer(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_SINC,
-    reverb_enabled=False,
+    filter_type=FILTER_TYPE_CHEBYSHEV,
+    echo_enabled=False,
     clipping_enabled=False,
+    reverb_enabled=None,
 ):
     player = EqualizerPlayer(
         file_path,
@@ -537,8 +564,9 @@ def play_wav_with_filter_shifting_buffer(
         taps,
         ring_buffer_size_bytes,
         band_gains_db,
-        reverb_enabled,
+        echo_enabled,
         clipping_enabled,
+        reverb_enabled,
     )
     player.play()
 

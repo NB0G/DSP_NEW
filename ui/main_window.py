@@ -31,7 +31,7 @@ from play_wav import (
     DUAL_THREAD_INPUT_FRAMES_PER_CYCLE,
     EqualizerPlayer,
     FILTER_TYPE_CHEBYSHEV,
-    FILTER_TYPE_SINC,
+    FILTER_TYPE_CHEBYSHEV_WINDOW_FIR,
     SINGLE_THREAD_INPUT_FRAMES_PER_CYCLE,
 )
 
@@ -39,12 +39,10 @@ from play_wav import (
 BANDS = [
     (1, "0-100"),
     (2, "100-300"),
-    (3, "300-700"),
-    (4, "700-1500"),
-    (5, "1500-3100"),
-    (6, "3100-6300"),
-    (7, "6300-12700"),
-    (8, "12700-22050"),
+    (3, "300-1000"),
+    (4, "1000-3000"),
+    (5, "3000-8000"),
+    (6, "8000-22050"),
 ]
 
 
@@ -59,7 +57,7 @@ class PlayerWorker(QObject):
         filter_type,
         ring_buffer_size_bytes,
         band_gains_db,
-        reverb_enabled,
+        echo_enabled,
         clipping_enabled,
     ):
         super().__init__()
@@ -69,7 +67,7 @@ class PlayerWorker(QObject):
             filter_type=filter_type,
             ring_buffer_size_bytes=ring_buffer_size_bytes,
             band_gains_db=band_gains_db,
-            reverb_enabled=reverb_enabled,
+            echo_enabled=echo_enabled,
             clipping_enabled=clipping_enabled,
         )
 
@@ -87,8 +85,8 @@ class PlayerWorker(QObject):
     def set_band_gain(self, band_number, gain_db):
         self.player.set_band_gain(band_number, gain_db)
 
-    def set_reverb_enabled(self, enabled):
-        self.player.set_reverb_enabled(enabled)
+    def set_echo_enabled(self, enabled):
+        self.player.set_echo_enabled(enabled)
 
     def set_clipping_enabled(self, enabled):
         self.player.set_clipping_enabled(enabled)
@@ -136,13 +134,13 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Эффекты")
         layout = QHBoxLayout(group)
 
-        self.reverb_enabled = QCheckBox("Реверберация")
+        self.echo_enabled = QCheckBox("Эхо")
         self.clipping_enabled = QCheckBox("Клиппинг")
 
-        self.reverb_enabled.toggled.connect(self.change_reverb_enabled)
+        self.echo_enabled.toggled.connect(self.change_echo_enabled)
         self.clipping_enabled.toggled.connect(self.change_clipping_enabled)
 
-        layout.addWidget(self.reverb_enabled)
+        layout.addWidget(self.echo_enabled)
         layout.addWidget(self.clipping_enabled)
         layout.addStretch(1)
 
@@ -158,8 +156,11 @@ class MainWindow(QMainWindow):
         self.buffer_mode.addItem("Смещающий", BUFFER_MODE_SHIFTING)
 
         self.filter_type = QComboBox()
-        self.filter_type.addItem("Окно Хемминга FIR", FILTER_TYPE_SINC)
-        self.filter_type.addItem("Чебышев I рода IIR", FILTER_TYPE_CHEBYSHEV)
+        self.filter_type.addItem("БИХ Чебышева II рода", FILTER_TYPE_CHEBYSHEV)
+        self.filter_type.addItem(
+            "КИХ, окно Чебышева",
+            FILTER_TYPE_CHEBYSHEV_WINDOW_FIR,
+        )
 
         self.ring_buffer_size_bytes = QSpinBox()
         self.ring_buffer_size_bytes.setRange(2, 512)
@@ -240,8 +241,8 @@ class MainWindow(QMainWindow):
             for band_number, slider in self.gain_sliders.items()
         }
 
-    def current_reverb_enabled(self):
-        return self.reverb_enabled.isChecked()
+    def current_echo_enabled(self):
+        return self.echo_enabled.isChecked()
 
     def current_clipping_enabled(self):
         return self.clipping_enabled.isChecked()
@@ -289,9 +290,9 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.set_band_gain(band_number, gain_db)
 
-    def change_reverb_enabled(self, enabled):
+    def change_echo_enabled(self, enabled):
         if self.worker is not None:
-            self.worker.set_reverb_enabled(enabled)
+            self.worker.set_echo_enabled(enabled)
 
     def change_clipping_enabled(self, enabled):
         if self.worker is not None:
@@ -312,7 +313,7 @@ class MainWindow(QMainWindow):
             filter_type=self.filter_type.currentData(),
             ring_buffer_size_bytes=self.current_ring_buffer_size_bytes(),
             band_gains_db=self.current_band_gains(),
-            reverb_enabled=self.current_reverb_enabled(),
+            echo_enabled=self.current_echo_enabled(),
             clipping_enabled=self.current_clipping_enabled(),
         )
         self.worker.moveToThread(self.thread)
