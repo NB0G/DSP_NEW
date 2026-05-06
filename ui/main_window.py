@@ -38,7 +38,7 @@ from filters.equalizer_bands import EQUALIZER_BANDS
 
 
 BANDS = [
-    (band_number, f"{low_cutoff_hz}-{high_cutoff_hz}")
+    (band_number, f"{low_cutoff_hz}-{high_cutoff_hz} Hz")
     for band_number, (low_cutoff_hz, high_cutoff_hz) in enumerate(
         EQUALIZER_BANDS,
         start=1,

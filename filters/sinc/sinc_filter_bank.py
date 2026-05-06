@@ -1,5 +1,6 @@
 from scipy.fft import fftshift, irfft, rfftfreq
 
+from filters.equalizer_bands import EQUALIZER_BANDS
 from util import (
     StreamingFirFilter,
     build_hamming_window,
@@ -8,16 +9,7 @@ from util import (
 )
 
 
-SINC_BANDS = [
-    (0, 100),
-    (100, 300),
-    (300, 700),
-    (700, 1500),
-    (1500, 3100),
-    (3100, 6300),
-    (6300, 12700),
-    (12700, 22050),
-]
+SINC_BANDS = EQUALIZER_BANDS
 DEFAULT_TAP_COUNT = 2049
 DEFAULT_FFT_SIZE = 8192
 
