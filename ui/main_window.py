@@ -34,15 +34,15 @@ from play_wav import (
     FILTER_TYPE_CHEBYSHEV_WINDOW_FIR,
     SINGLE_THREAD_INPUT_FRAMES_PER_CYCLE,
 )
+from filters.equalizer_bands import EQUALIZER_BANDS
 
 
 BANDS = [
-    (1, "0-100"),
-    (2, "100-300"),
-    (3, "300-1000"),
-    (4, "1000-3000"),
-    (5, "3000-8000"),
-    (6, "8000-22050"),
+    (band_number, f"{low_cutoff_hz}-{high_cutoff_hz}")
+    for band_number, (low_cutoff_hz, high_cutoff_hz) in enumerate(
+        EQUALIZER_BANDS,
+        start=1,
+    )
 ]
 
 
@@ -57,8 +57,8 @@ class PlayerWorker(QObject):
         filter_type,
         ring_buffer_size_bytes,
         band_gains_db,
-        echo_enabled,
-        clipping_enabled,
+        reverb_enabled,
+        vibrato_enabled,
     ):
         super().__init__()
         self.player = EqualizerPlayer(
@@ -67,8 +67,8 @@ class PlayerWorker(QObject):
             filter_type=filter_type,
             ring_buffer_size_bytes=ring_buffer_size_bytes,
             band_gains_db=band_gains_db,
-            echo_enabled=echo_enabled,
-            clipping_enabled=clipping_enabled,
+            reverb_enabled=reverb_enabled,
+            vibrato_enabled=vibrato_enabled,
         )
 
     def run(self):
@@ -85,11 +85,11 @@ class PlayerWorker(QObject):
     def set_band_gain(self, band_number, gain_db):
         self.player.set_band_gain(band_number, gain_db)
 
-    def set_echo_enabled(self, enabled):
-        self.player.set_echo_enabled(enabled)
+    def set_reverb_enabled(self, enabled):
+        self.player.set_reverb_enabled(enabled)
 
-    def set_clipping_enabled(self, enabled):
-        self.player.set_clipping_enabled(enabled)
+    def set_vibrato_enabled(self, enabled):
+        self.player.set_vibrato_enabled(enabled)
 
 
 class MainWindow(QMainWindow):
@@ -134,14 +134,14 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Эффекты")
         layout = QHBoxLayout(group)
 
-        self.echo_enabled = QCheckBox("Эхо")
-        self.clipping_enabled = QCheckBox("Клиппинг")
+        self.reverb_enabled = QCheckBox("Реверберация")
+        self.vibrato_enabled = QCheckBox("Вибрато")
 
-        self.echo_enabled.toggled.connect(self.change_echo_enabled)
-        self.clipping_enabled.toggled.connect(self.change_clipping_enabled)
+        self.reverb_enabled.toggled.connect(self.change_reverb_enabled)
+        self.vibrato_enabled.toggled.connect(self.change_vibrato_enabled)
 
-        layout.addWidget(self.echo_enabled)
-        layout.addWidget(self.clipping_enabled)
+        layout.addWidget(self.reverb_enabled)
+        layout.addWidget(self.vibrato_enabled)
         layout.addStretch(1)
 
         return group
@@ -156,11 +156,11 @@ class MainWindow(QMainWindow):
         self.buffer_mode.addItem("Смещающий", BUFFER_MODE_SHIFTING)
 
         self.filter_type = QComboBox()
-        self.filter_type.addItem("БИХ Чебышева II рода", FILTER_TYPE_CHEBYSHEV)
         self.filter_type.addItem(
             "КИХ, окно Чебышева",
             FILTER_TYPE_CHEBYSHEV_WINDOW_FIR,
         )
+        self.filter_type.addItem("БИХ Чебышева II рода", FILTER_TYPE_CHEBYSHEV)
 
         self.ring_buffer_size_bytes = QSpinBox()
         self.ring_buffer_size_bytes.setRange(2, 512)
@@ -241,11 +241,11 @@ class MainWindow(QMainWindow):
             for band_number, slider in self.gain_sliders.items()
         }
 
-    def current_echo_enabled(self):
-        return self.echo_enabled.isChecked()
+    def current_reverb_enabled(self):
+        return self.reverb_enabled.isChecked()
 
-    def current_clipping_enabled(self):
-        return self.clipping_enabled.isChecked()
+    def current_vibrato_enabled(self):
+        return self.vibrato_enabled.isChecked()
 
     def current_ring_buffer_size_bytes(self):
         value = self.ring_buffer_size_bytes.value()
@@ -290,13 +290,13 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.set_band_gain(band_number, gain_db)
 
-    def change_echo_enabled(self, enabled):
+    def change_reverb_enabled(self, enabled):
         if self.worker is not None:
-            self.worker.set_echo_enabled(enabled)
+            self.worker.set_reverb_enabled(enabled)
 
-    def change_clipping_enabled(self, enabled):
+    def change_vibrato_enabled(self, enabled):
         if self.worker is not None:
-            self.worker.set_clipping_enabled(enabled)
+            self.worker.set_vibrato_enabled(enabled)
 
     def start_playback(self):
         if not self.file_path:
@@ -313,8 +313,8 @@ class MainWindow(QMainWindow):
             filter_type=self.filter_type.currentData(),
             ring_buffer_size_bytes=self.current_ring_buffer_size_bytes(),
             band_gains_db=self.current_band_gains(),
-            echo_enabled=self.current_echo_enabled(),
-            clipping_enabled=self.current_clipping_enabled(),
+            reverb_enabled=self.current_reverb_enabled(),
+            vibrato_enabled=self.current_vibrato_enabled(),
         )
         self.worker.moveToThread(self.thread)
 

@@ -1,17 +1,20 @@
 import numpy as np
 from scipy.signal import cheby2, sosfilt
 
+from filters.equalizer_bands import EQUALIZER_BANDS
 from util import db_to_gain
 
 
-CHEBYSHEV_BANDS = [
-    ("low_pass", 0, 100),
-    ("band_pass", 100, 300),
-    ("band_pass", 300, 1000),
-    ("band_pass", 1000, 3000),
-    ("band_pass", 3000, 8000),
-    ("high_pass", 8000, 22050),
-]
+CHEBYSHEV_BANDS = []
+for band_index, (low_cutoff_hz, high_cutoff_hz) in enumerate(EQUALIZER_BANDS):
+    if band_index == 0:
+        filter_type = "low_pass"
+    elif band_index == len(EQUALIZER_BANDS) - 1:
+        filter_type = "high_pass"
+    else:
+        filter_type = "band_pass"
+
+    CHEBYSHEV_BANDS.append((filter_type, low_cutoff_hz, high_cutoff_hz))
 DEFAULT_ORDER = 4
 DEFAULT_STOPBAND_ATTENUATION_DB = 40
 NYQUIST_MARGIN = 0.99

@@ -1,6 +1,7 @@
 import time
 import wave
 from array import array
+from math import floor, sin, tau
 from threading import Thread
 
 from buffers.dual_thread_ring_buffer import RingBufferDualThread
@@ -11,6 +12,7 @@ from filters.chebyshev_window.chebyshev_window_filter_bank import (
     ChebyshevWindowFirFilterBank,
     DEFAULT_TAP_COUNT,
 )
+from filters.equalizer_bands import EQUALIZER_BANDS
 
 
 DEFAULT_BLOCK_SIZE = 64
@@ -19,25 +21,25 @@ DUAL_THREAD_INPUT_FRAMES_PER_CYCLE = 2
 SINGLE_THREAD_INPUT_FRAMES_PER_CYCLE = 8
 RING_BUFFER_OUTPUT_FRAMES_PER_CYCLE = 1
 SAMPLE_READ_TIMEOUT_SECONDS = 0.01
-DEFAULT_ECHO_DELAY_MS = 220
-DEFAULT_ECHO_FEEDBACK = 0.35
-DEFAULT_ECHO_WET = 0.4
-DEFAULT_CLIPPING_THRESHOLD = 1200
+DEFAULT_REVERB_DELAYS_MS = (23, 31, 47, 61, 83, 107)
+DEFAULT_REVERB_FEEDBACK = 0.72
+DEFAULT_REVERB_WET = 0.75
+DEFAULT_REVERB_DAMPING = 0.22
+DEFAULT_VIBRATO_RATE_HZ = 5.0
+DEFAULT_VIBRATO_DEPTH_MS = 6.0
+DEFAULT_VIBRATO_BASE_DELAY_MS = 8.0
 BUFFER_MODE_DUAL_THREAD = "dual_thread"
 BUFFER_MODE_SINGLE_THREAD = "single_thread"
 BUFFER_MODE_SHIFTING = "shifting"
 FILTER_TYPE_CHEBYSHEV = "chebyshev_iir"
 FILTER_TYPE_CHEBYSHEV_WINDOW_FIR = "chebyshev_window_fir"
 FILTER_TYPE_SINC = FILTER_TYPE_CHEBYSHEV_WINDOW_FIR
+DEFAULT_FILTER_TYPE = FILTER_TYPE_CHEBYSHEV_WINDOW_FIR
 OUTPUT_CHANNELS = 1
 BYTES_PER_SAMPLE = 2
 DEFAULT_BAND_GAINS_DB = {
-    1: 0,
-    2: 0,
-    3: 0,
-    4: 0,
-    5: 0,
-    6: 0,
+    band_number: 0
+    for band_number in range(1, len(EQUALIZER_BANDS) + 1)
 }
 
 
@@ -111,7 +113,7 @@ def build_filter_bank(
     sample_rate,
     taps,
     band_gains_db=None,
-    filter_type=FILTER_TYPE_CHEBYSHEV,
+    filter_type=DEFAULT_FILTER_TYPE,
 ):
     if filter_type == FILTER_TYPE_CHEBYSHEV:
         return build_chebyshev_filter_bank(sample_rate, band_gains_db)
@@ -140,38 +142,92 @@ def process_samples_with_filter_bank(samples, filters):
     return mix_filter_outputs(filter_outputs)
 
 
-def clip_samples(samples, threshold=DEFAULT_CLIPPING_THRESHOLD):
-    return [max(-threshold, min(threshold, sample)) for sample in samples]
-
-
-class EchoEffect:
+class ReverbEffect:
     def __init__(
         self,
         sample_rate,
-        delay_ms=DEFAULT_ECHO_DELAY_MS,
-        feedback=DEFAULT_ECHO_FEEDBACK,
-        wet=DEFAULT_ECHO_WET,
+        delays_ms=DEFAULT_REVERB_DELAYS_MS,
+        feedback=DEFAULT_REVERB_FEEDBACK,
+        wet=DEFAULT_REVERB_WET,
+        damping=DEFAULT_REVERB_DAMPING,
     ):
-        delay_samples = max(1, int(sample_rate * delay_ms / 1000))
-        self.buffer = [0.0] * delay_samples
-        self.index = 0
+        self.buffers = [
+            [0.0] * max(1, int(sample_rate * delay_ms / 1000))
+            for delay_ms in delays_ms
+        ]
+        self.indexes = [0] * len(self.buffers)
+        self.damped_samples = [0.0] * len(self.buffers)
         self.feedback = feedback
         self.wet = wet
+        self.damping = damping
 
     def process_samples(self, samples):
         processed_samples = []
 
         for sample in samples:
-            delayed_sample = self.buffer[self.index]
-            output_sample = sample + delayed_sample * self.wet
-            self.buffer[self.index] = sample + delayed_sample * self.feedback
-            self.index = (self.index + 1) % len(self.buffer)
+            reverb_sample = 0.0
+
+            for delay_index, delay_buffer in enumerate(self.buffers):
+                buffer_index = self.indexes[delay_index]
+                delayed_sample = delay_buffer[buffer_index]
+                damped_sample = (
+                    self.damping * self.damped_samples[delay_index]
+                    + (1 - self.damping) * delayed_sample
+                )
+                self.damped_samples[delay_index] = damped_sample
+                delay_buffer[buffer_index] = sample + damped_sample * self.feedback
+                self.indexes[delay_index] = (buffer_index + 1) % len(delay_buffer)
+                reverb_sample += damped_sample
+
+            reverb_sample /= len(self.buffers) ** 0.5
+            output_sample = sample + reverb_sample * self.wet
             processed_samples.append(output_sample)
 
         return processed_samples
 
 
-ReverbEffect = EchoEffect
+class VibratoEffect:
+    def __init__(
+        self,
+        sample_rate,
+        rate_hz=DEFAULT_VIBRATO_RATE_HZ,
+        depth_ms=DEFAULT_VIBRATO_DEPTH_MS,
+        base_delay_ms=DEFAULT_VIBRATO_BASE_DELAY_MS,
+    ):
+        self.sample_rate = sample_rate
+        self.rate_hz = rate_hz
+        self.depth_samples = sample_rate * depth_ms / 1000
+        self.base_delay_samples = sample_rate * base_delay_ms / 1000
+        max_delay_samples = int(self.base_delay_samples + self.depth_samples + 2)
+        self.buffer = [0.0] * max(2, max_delay_samples)
+        self.write_index = 0
+        self.phase = 0.0
+        self.phase_step = tau * rate_hz / sample_rate
+
+    def process_samples(self, samples):
+        processed_samples = []
+        buffer_size = len(self.buffer)
+
+        for sample in samples:
+            self.buffer[self.write_index] = sample
+            delay_samples = (
+                self.base_delay_samples
+                + sin(self.phase) * self.depth_samples
+            )
+            read_index = (self.write_index - delay_samples) % buffer_size
+            left_index = int(floor(read_index))
+            right_index = (left_index + 1) % buffer_size
+            fraction = read_index - left_index
+            delayed_sample = (
+                self.buffer[left_index] * (1 - fraction)
+                + self.buffer[right_index] * fraction
+            )
+
+            processed_samples.append(delayed_sample)
+            self.write_index = (self.write_index + 1) % buffer_size
+            self.phase = (self.phase + self.phase_step) % tau
+
+        return processed_samples
 
 
 class EqualizerPlayer:
@@ -179,13 +235,12 @@ class EqualizerPlayer:
         self,
         file_path,
         buffer_mode=BUFFER_MODE_DUAL_THREAD,
-        filter_type=FILTER_TYPE_CHEBYSHEV,
+        filter_type=DEFAULT_FILTER_TYPE,
         taps=DEFAULT_TAP_COUNT,
         ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
         band_gains_db=None,
-        echo_enabled=False,
-        clipping_enabled=False,
-        reverb_enabled=None,
+        reverb_enabled=False,
+        vibrato_enabled=False,
     ):
         self.file_path = file_path
         self.buffer_mode = buffer_mode
@@ -195,11 +250,12 @@ class EqualizerPlayer:
         self.ring_buffer_size_bytes = ring_buffer_size_bytes
         self.band_gains_db = DEFAULT_BAND_GAINS_DB.copy()
         self.filters = []
-        self.echo = None
+        self.reverb = None
+        self.vibrato = None
         self.ring_buffer = None
         self.stopped = False
-        self.echo_enabled = echo_enabled if reverb_enabled is None else reverb_enabled
-        self.clipping_enabled = clipping_enabled
+        self.reverb_enabled = reverb_enabled
+        self.vibrato_enabled = vibrato_enabled
 
         if band_gains_db is not None:
             self.band_gains_db.update(band_gains_db)
@@ -213,14 +269,11 @@ class EqualizerPlayer:
             else:
                 self.filters[band_number - 1].set_gain_db(gain_db)
 
-    def set_echo_enabled(self, enabled):
-        self.echo_enabled = enabled
-
     def set_reverb_enabled(self, enabled):
-        self.set_echo_enabled(enabled)
+        self.reverb_enabled = enabled
 
-    def set_clipping_enabled(self, enabled):
-        self.clipping_enabled = enabled
+    def set_vibrato_enabled(self, enabled):
+        self.vibrato_enabled = enabled
 
     def stop(self):
         self.stopped = True
@@ -243,16 +296,17 @@ class EqualizerPlayer:
             self.band_gains_db,
             self.filter_type,
         )
-        self.echo = EchoEffect(sample_rate)
+        self.reverb = ReverbEffect(sample_rate)
+        self.vibrato = VibratoEffect(sample_rate)
 
     def process_audio_samples(self, samples):
         processed_samples = process_samples_with_filter_bank(samples, self.filters)
 
-        if self.echo_enabled:
-            processed_samples = self.echo.process_samples(processed_samples)
+        if self.reverb_enabled:
+            processed_samples = self.reverb.process_samples(processed_samples)
 
-        if self.clipping_enabled:
-            processed_samples = clip_samples(processed_samples)
+        if self.vibrato_enabled:
+            processed_samples = self.vibrato.process_samples(processed_samples)
 
         return processed_samples
 
@@ -504,21 +558,19 @@ def play_wav_with_filter_dual_thread(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_CHEBYSHEV,
-    echo_enabled=False,
-    clipping_enabled=False,
-    reverb_enabled=None,
+    filter_type=DEFAULT_FILTER_TYPE,
+    reverb_enabled=False,
+    vibrato_enabled=False,
 ):
     player = EqualizerPlayer(
-        file_path,
-        BUFFER_MODE_DUAL_THREAD,
-        filter_type,
-        taps,
-        ring_buffer_size_bytes,
-        band_gains_db,
-        echo_enabled,
-        clipping_enabled,
-        reverb_enabled,
+        file_path=file_path,
+        buffer_mode=BUFFER_MODE_DUAL_THREAD,
+        filter_type=filter_type,
+        taps=taps,
+        ring_buffer_size_bytes=ring_buffer_size_bytes,
+        band_gains_db=band_gains_db,
+        reverb_enabled=reverb_enabled,
+        vibrato_enabled=vibrato_enabled,
     )
     player.play()
 
@@ -528,21 +580,19 @@ def play_wav_with_filter_single_thread(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_CHEBYSHEV,
-    echo_enabled=False,
-    clipping_enabled=False,
-    reverb_enabled=None,
+    filter_type=DEFAULT_FILTER_TYPE,
+    reverb_enabled=False,
+    vibrato_enabled=False,
 ):
     player = EqualizerPlayer(
-        file_path,
-        BUFFER_MODE_SINGLE_THREAD,
-        filter_type,
-        taps,
-        ring_buffer_size_bytes,
-        band_gains_db,
-        echo_enabled,
-        clipping_enabled,
-        reverb_enabled,
+        file_path=file_path,
+        buffer_mode=BUFFER_MODE_SINGLE_THREAD,
+        filter_type=filter_type,
+        taps=taps,
+        ring_buffer_size_bytes=ring_buffer_size_bytes,
+        band_gains_db=band_gains_db,
+        reverb_enabled=reverb_enabled,
+        vibrato_enabled=vibrato_enabled,
     )
     player.play()
 
@@ -552,21 +602,19 @@ def play_wav_with_filter_shifting_buffer(
     taps=DEFAULT_TAP_COUNT,
     band_gains_db=None,
     ring_buffer_size_bytes=DEFAULT_RING_BUFFER_SIZE_BYTES,
-    filter_type=FILTER_TYPE_CHEBYSHEV,
-    echo_enabled=False,
-    clipping_enabled=False,
-    reverb_enabled=None,
+    filter_type=DEFAULT_FILTER_TYPE,
+    reverb_enabled=False,
+    vibrato_enabled=False,
 ):
     player = EqualizerPlayer(
-        file_path,
-        BUFFER_MODE_SHIFTING,
-        filter_type,
-        taps,
-        ring_buffer_size_bytes,
-        band_gains_db,
-        echo_enabled,
-        clipping_enabled,
-        reverb_enabled,
+        file_path=file_path,
+        buffer_mode=BUFFER_MODE_SHIFTING,
+        filter_type=filter_type,
+        taps=taps,
+        ring_buffer_size_bytes=ring_buffer_size_bytes,
+        band_gains_db=band_gains_db,
+        reverb_enabled=reverb_enabled,
+        vibrato_enabled=vibrato_enabled,
     )
     player.play()
 

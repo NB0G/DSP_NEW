@@ -1,14 +1,14 @@
 # AI Maintenance Notes
 
-Проект - учебный программный аудиопроигрыватель с 6-полосным эквалайзером, тремя типами буфера и двумя вариантами фильтрации.
+Проект - учебный программный аудиопроигрыватель с 10-полосным эквалайзером, тремя типами буфера и двумя вариантами фильтрации.
 
 ## Актуальные требования
 
-- звуковой эффект 1: эхо;
-- звуковой эффект 2: клиппинг;
-- количество полос эквалайзера: 6;
-- основной тип фильтра: БИХ Чебышева II рода;
-- альтернативный тип фильтра: КИХ с окном Чебышева.
+- звуковой эффект 1: реверберация;
+- звуковой эффект 2: вибрато;
+- количество полос эквалайзера: 10;
+- основной тип фильтра: КИХ с окном Чебышева;
+- альтернативный тип фильтра: БИХ Чебышева II рода.
 
 ## Структура
 
@@ -22,6 +22,7 @@ buffers/
   shifting_buffer.py
 
 filters/
+  equalizer_bands.py
   chebyshev/
     chebyshev_filter_bank.py
   chebyshev_window/
@@ -38,7 +39,7 @@ ui/
 Главная цепочка:
 
 ```text
-WAV bytes -> mono samples -> filter bank -> echo/clipping -> selected buffer -> PyAudio
+WAV bytes -> mono samples -> filter bank -> reverb/vibrato -> selected buffer -> PyAudio
 ```
 
 `play_wav.py` содержит чтение WAV, перевод stereo в mono, конвертацию PCM bytes <-> samples, выбор буфера, выбор типа фильтра, применение эффектов и запуск воспроизведения через PyAudio.
@@ -48,6 +49,7 @@ WAV bytes -> mono samples -> filter bank -> echo/clipping -> selected buffer -> 
 ```python
 FILTER_TYPE_CHEBYSHEV = "chebyshev_iir"
 FILTER_TYPE_CHEBYSHEV_WINDOW_FIR = "chebyshev_window_fir"
+DEFAULT_FILTER_TYPE = FILTER_TYPE_CHEBYSHEV_WINDOW_FIR
 BUFFER_MODE_DUAL_THREAD = "dual_thread"
 BUFFER_MODE_SINGLE_THREAD = "single_thread"
 BUFFER_MODE_SHIFTING = "shifting"
@@ -55,18 +57,24 @@ BYTES_PER_SAMPLE = 2
 OUTPUT_CHANNELS = 1
 ```
 
-`FILTER_TYPE_CHEBYSHEV` является основным вариантом и выбран первым в UI.
+`FILTER_TYPE_CHEBYSHEV_WINDOW_FIR` является основным вариантом и выбран первым в UI. `FILTER_TYPE_CHEBYSHEV` оставлен как альтернативный БИХ-вариант.
 
 ## Полосы эквалайзера
 
 ```text
-1: 0-100 Hz
-2: 100-300 Hz
-3: 300-1000 Hz
-4: 1000-3000 Hz
-5: 3000-8000 Hz
-6: 8000-22050 Hz
+1: 0-31 Hz
+2: 31-63 Hz
+3: 63-125 Hz
+4: 125-250 Hz
+5: 250-500 Hz
+6: 500-1000 Hz
+7: 1000-2000 Hz
+8: 2000-4000 Hz
+9: 4000-8000 Hz
+10: 8000-22050 Hz
 ```
+
+Единый список полос хранится в `filters/equalizer_bands.py`; UI и оба filter bank используют этот список.
 
 UI передает значения в dB от `0` до `-100`. Перевод в линейный коэффициент делает:
 
@@ -75,23 +83,7 @@ def db_to_gain(db):
     return 10 ** (db / 20)
 ```
 
-## Основной фильтр: БИХ Чебышева II рода
-
-Реализация находится в:
-
-```text
-filters/chebyshev/chebyshev_filter_bank.py
-```
-
-`ChebyshevFilterBank` строит шесть потоковых SOS-фильтров через `scipy.signal.cheby2(..., output="sos")`:
-
-- НЧ для первой полосы;
-- полосовые фильтры для средних полос;
-- ВЧ для последней полосы.
-
-Каждый фильтр хранит состояние `zi`, поэтому обработка последовательных аудиоблоков непрерывна. При изменении слайдера пересчитывается только gain соответствующей полосы.
-
-## Альтернативный фильтр: КИХ с окном Чебышева
+## Основной фильтр: КИХ с окном Чебышева
 
 Реализация находится в:
 
@@ -99,42 +91,59 @@ filters/chebyshev/chebyshev_filter_bank.py
 filters/chebyshev_window/chebyshev_window_filter_bank.py
 ```
 
-`ChebyshevWindowFirFilterBank` строит суммарную АЧХ 6-полосного эквалайзера, получает импульсную характеристику через `irfft`, берет центральный фрагмент длиной `DEFAULT_TAP_COUNT` и применяет окно Чебышева `scipy.signal.windows.chebwin`.
+`ChebyshevWindowFirFilterBank` строит суммарную АЧХ 10-полосного эквалайзера, получает импульсную характеристику через `irfft`, берет центральный фрагмент длиной `DEFAULT_TAP_COUNT` и применяет окно Чебышева `scipy.signal.windows.chebwin`.
+
+## Альтернативный фильтр: БИХ Чебышева II рода
+
+Реализация находится в:
+
+```text
+filters/chebyshev/chebyshev_filter_bank.py
+```
+
+`ChebyshevFilterBank` строит 10 потоковых SOS-фильтров через `scipy.signal.cheby2(..., output="sos")`:
+
+- НЧ для первой полосы;
+- полосовые фильтры для средних полос;
+- ВЧ для последней полосы.
+
+Каждый фильтр хранит состояние `zi`, поэтому обработка последовательных аудиоблоков непрерывна. При изменении слайдера пересчитывается только gain соответствующей полосы.
 
 ## Эффекты
 
 Эффекты находятся в `play_wav.py` и применяются после эквалайзера.
 
-### Эхо
+### Реверберация
 
 Класс:
 
 ```python
-EchoEffect
+ReverbEffect
 ```
 
-Это delay-line эффект с обратной связью:
+Это несколько delay-line линий с обратной связью и damping:
 
 ```python
-DEFAULT_ECHO_DELAY_MS = 220
-DEFAULT_ECHO_FEEDBACK = 0.35
-DEFAULT_ECHO_WET = 0.4
+DEFAULT_REVERB_DELAYS_MS = (23, 31, 47, 61, 83, 107)
+DEFAULT_REVERB_FEEDBACK = 0.72
+DEFAULT_REVERB_WET = 0.75
+DEFAULT_REVERB_DAMPING = 0.22
 ```
 
-Для обратной совместимости `ReverbEffect` оставлен как alias к `EchoEffect`, а `set_reverb_enabled(...)` вызывает `set_echo_enabled(...)`.
+### Вибрато
 
-### Клиппинг
-
-Функция:
+Класс:
 
 ```python
-clip_samples(...)
+VibratoEffect
 ```
 
-Это hard clipping по порогу:
+Это потоковый модулируемый delay-line с линейной интерполяцией:
 
 ```python
-DEFAULT_CLIPPING_THRESHOLD = 12000
+DEFAULT_VIBRATO_RATE_HZ = 5.0
+DEFAULT_VIBRATO_DEPTH_MS = 6.0
+DEFAULT_VIBRATO_BASE_DELAY_MS = 8.0
 ```
 
 Финальная защита диапазона int16 остается в `clamp_int16(...)`.
@@ -147,20 +156,20 @@ DEFAULT_CLIPPING_THRESHOLD = 12000
 ui/main_window.py
 ```
 
-Интерфейс позволяет выбрать WAV-файл, тип буфера, тип фильтра, включить эхо/клиппинг, изменить размер буфера и отрегулировать 6 полос эквалайзера.
+Интерфейс позволяет выбрать WAV-файл, тип буфера, тип фильтра, включить реверберацию/вибрато, изменить размер буфера и отрегулировать 10 полос эквалайзера.
 
 Типы фильтров в UI:
 
 ```text
-БИХ Чебышева II рода
 КИХ, окно Чебышева
+БИХ Чебышева II рода
 ```
 
 Эффекты в UI:
 
 ```text
-[ ] Эхо
-[ ] Клиппинг
+[ ] Реверберация
+[ ] Вибрато
 ```
 
 ## Проверка после изменений

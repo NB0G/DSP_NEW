@@ -1,17 +1,11 @@
 from scipy.fft import fftshift, irfft, rfftfreq
 from scipy.signal.windows import chebwin
 
+from filters.equalizer_bands import EQUALIZER_BANDS
 from util import StreamingFirFilter, db_to_gain, make_odd
 
 
-CHEBYSHEV_WINDOW_BANDS = [
-    (0, 100),
-    (100, 300),
-    (300, 1000),
-    (1000, 3000),
-    (3000, 8000),
-    (8000, 22050),
-]
+CHEBYSHEV_WINDOW_BANDS = EQUALIZER_BANDS
 DEFAULT_TAP_COUNT = 2049
 DEFAULT_FFT_SIZE = 8192
 DEFAULT_WINDOW_ATTENUATION_DB = 80
