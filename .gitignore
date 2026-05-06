@@ -6,3 +6,4 @@
 .idea/inspectionProfiles/profiles_settings.xml
 .idea/inspectionProfiles/Project_Default.xml
 __pycache__/sinc_filter.cpython-311.pyc
+*.wav
